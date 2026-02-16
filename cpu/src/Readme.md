@@ -5,101 +5,87 @@
 - Use pseudocode or simple explanations where necessary to make it easy to understand.
 - Don't forget to cite any resources that you've used to complete the assignment.
 
-Here is the raw Markdown content for your cpu/src/Readme.md. You can copy and paste the code block below directly into your file.
-
-Markdown
 # VCPU Scheduler
 
-## Algorithm and Logic Design
+## Algorithm Design
 
-The goal of this VCPU scheduler is to dynamically balance the CPU load of active virtual machines (Domains) across the host's physical CPUs (pCPUs). The scheduler operates as a userspace daemon that wakes up at a user-defined interval to assess the current system state and mitigate load imbalances.
+The goal of this scheduler is to balance the CPU load of active Virtual Machines (vCPUs) across the available Physical CPUs (pCPUs) while minimizing unnecessary migrations ("pin changes") to maintain stability.
 
-### Core Logic
-The algorithm follows a **Measure-Analyze-Act** loop:
+### 1. Metric: CPU Utilization
+The scheduler calculates the load for each vCPU by tracking the cumulative `cpuTime` provided by the hypervisor.
+* **Formula:** `Usage = (Current_cpuTime - Prev_cpuTime) / Interval`
+* **Handling New VMs:** When a VM is detected for the first time, its usage is skipped for that interval to prevent erroneous "0.0" or "100.0" spikes caused by uninitialized history data.
 
-1.  **Measure (Data Collection):**
-    * The scheduler queries the hypervisor via `libvirt` to list all active domains.
-    * For every vCPU in each domain, it fetches `cpu_time` (accumulated nanoseconds of usage).
-    * **Metric Calculation:** Since `cpu_time` is cumulative, we store the state from the *previous* iteration. The utilization percentage is calculated as:
-        $$\text{Usage} (\%) = \frac{\text{Current CPU Time} - \text{Previous CPU Time}}{\text{Interval Time}} \times 100$$
-    * These vCPU loads are then aggregated onto the pCPUs they are currently pinned to, giving us the total load for each physical core.
+### 2. Balance Metric: Standard Deviation
+To determine if the system is unbalanced, the algorithm calculates the **Standard Deviation (StdDev)** of the loads across all pCPUs.
+* **Threshold:** A rebalance is only triggered if `StdDev > 5.0`. This prevents the scheduler from reacting to background noise or negligible imbalances, ensuring the system remains stable when "good enough".
 
-2.  **Analyze (Imbalance Detection):**
-    * We calculate the **Standard Deviation ($\sigma$)** of the pCPU loads.
-    * A threshold is defined (typically $\sigma \le 5.0$).
-    * If the standard deviation is below the threshold, the system is considered **Balanced**, and no actions are taken (to preserve stability).
-    * If $\sigma > 5.0$, the system is **Unbalanced**.
+### 3. Victim Selection (Heaviest First)
+If rebalancing is required, the scheduler identifies:
+* **Source:** The **Busiest pCPU** (highest current load).
+* **Target:** The **Idlest pCPU** (lowest current load).
+* **Victim vCPU:** The vCPU on the Source pCPU with the **highest individual load**. Moving the heaviest task minimizes the number of moves required to achieve balance.
 
-3.  **Act (Rebalancing Strategy):**
-    * The algorithm identifies the pCPU with the **highest load** (Source) and the pCPU with the **lowest load** (Target).
-    * It selects a vCPU from the Source pCPU to migrate to the Target pCPU.
-    * **Heuristic:** The scheduler attempts to move a vCPU such that the move reduces the load difference between the Source and Target, bringing the system closer to the average load.
-    * This pin is applied immediately using `virDomainPinVcpu`.
+### 4. Stability Check: Projected Standard Deviation
+Before performing any migration, the algorithm performs a **lookahead check**:
+1.  It simulates moving the selected victim vCPU to the target pCPU mathematically.
+2.  It calculates the **Projected StdDev** of this theoretical configuration.
+3.  **Decision Rule:** The move is executed **only if** `Projected StdDev < Current StdDev`.
+    * This prevents "ping-ponging," where moving a task causes the target CPU to become overloaded, leading to an infinite loop of swapping.
+
+---
 
 ## Program Flow
 
-The program structure consists of initialization followed by an infinite loop:
+The program runs as a daemon loop with the following steps:
 
-1.  **Initialization:**
-    * Open connection to QEMU/KVM hypervisor (`virConnectOpen`).
-    * Discover host topology (number of pCPUs).
-    * Allocate memory for tracking `DomainState` (previous CPU times).
+1.  **Initialization:** Connect to the `qemu:///system` hypervisor and detect the number of physical CPUs.
+2.  **Data Collection:**
+    * Query the list of active domains (VMs).
+    * Iterate through every vCPU of every domain.
+    * Update the persistent `NodeData` structure with the current `cpuTime`.
+    * Aggregate individual vCPU loads to calculate the total load for each pCPU.
+3.  **Analysis:**
+    * Calculate the mean load and Standard Deviation of the pCPUs.
+    * Identify the Busiest and Idlest pCPUs.
+4.  **Decision Making:**
+    * **Check 1:** Is `StdDev > 5.0`? If no, sleep and wait for the next interval.
+    * **Check 2:** Find the heaviest vCPU on the busiest core.
+    * **Check 3:** Would moving this vCPU reduce the StdDev?
+5.  **Execution:**
+    * If all checks pass, pin the victim vCPU to the Idlest pCPU using `virDomainPinVcpu`.
+6.  **Cleanup:** Free memory allocated for domain info and maps to prevent leaks.
 
-2.  **The Scheduler Loop:**
-    * **Sleep:** Wait for the specified `interval`.
-    * **Cleanup:** Free data from domains that have shut down since the last interval.
-    * **Update Stats:** Fetch current time and CPU stats for all active domains.
-    * **Map & Aggregate:** Construct a map of `pCPU -> [vCPU1, vCPU2, ...]`. Compute total load per pCPU.
-    * **Check Balance:** Compute Standard Deviation of pCPU loads.
-    * **Rebalance (if needed):**
-        * Find `pCPU_max` and `pCPU_min`.
-        * Identify best vCPU to move.
-        * Call `virDomainPinVcpu` to update affinity.
-    * **Commit State:** Update `previous_cpu_time` = `current_cpu_time` for the next iteration.
+---
 
 ## Pseudocode
 
-```c
-struct DomainState {
-    unsigned long long prev_cpu_time;
-    // ... other tracking info
-};
+```text
+While (Running):
+    pCPU_Loads = [0, 0, 0, 0]
+    
+    For each VM in Active_Domains:
+        Usage = (VM.Time_Now - VM.Time_Prev) / Interval
+        pCPU_Loads[VM.Current_pCPU] += Usage
+        Update_History(VM)
 
-void CPUScheduler(double interval) {
-    virConnectPtr conn = virConnectOpen("qemu:///system");
-    int num_pcpus = virNodeGetInfo(conn, ...);
+    Current_StdDev = Calculate_StdDev(pCPU_Loads)
 
-    while (true) {
-        sleep(interval);
+    If (Current_StdDev > 5.0):
+        Source = Index_Of_Max(pCPU_Loads)
+        Target = Index_Of_Min(pCPU_Loads)
         
-        // 1. Get Active Domains
-        virDomainPtr* domains = virConnectListAllDomains(conn, ...);
+        Victim_VM = Find_Heaviest_VM_On(Source)
         
-        // 2. Calculate Load per pCPU
-        double pcpu_loads[num_pcpus] = {0};
+        # Stability Check
+        Simulated_Loads = pCPU_Loads
+        Simulated_Loads[Source] -= Victim_VM.Load
+        Simulated_Loads[Target] += Victim_VM.Load
         
-        foreach (domain in domains) {
-            unsigned long long current_time = virDomainGetCPUStats(domain);
-            double load = (current_time - domain->prev_cpu_time) / interval;
-            
-            int current_pin = get_current_pcpu_pin(domain);
-            pcpu_loads[current_pin] += load;
-            
-            // Update history for next time
-            domain->prev_cpu_time = current_time;
-        }
-
-        // 3. Check for Imbalance
-        double std_dev = calculate_std_dev(pcpu_loads);
+        Projected_StdDev = Calculate_StdDev(Simulated_Loads)
         
-        if (std_dev > 5.0) {
-            // 4. Rebalance
-            int source_pcpu = find_max_load_pcpu(pcpu_loads);
-            int target_pcpu = find_min_load_pcpu(pcpu_loads);
+        If (Projected_StdDev < Current_StdDev):
+            Pin(Victim_VM, Target)
+            Print "Moved vCPU for better balance."
             
-            virDomainPtr vcpu_to_move = find_best_vcpu(source_pcpu);
-            
-            virDomainPinVcpu(vcpu_to_move, target_pcpu);
-        }
-    }
-}
+    Sleep(Interval)

@@ -71,7 +71,7 @@ int main(int argc, char *argv[])
 /* COMPLETE THE IMPLEMENTATION */
 void CPUScheduler(virConnectPtr conn, int interval)
 {
-	// --- 1. GET HOST TOPOLOGY ---
+    // --- 1. GET HOST TOPOLOGY ---
     virNodeInfo node_info;
     if (virNodeGetInfo(conn, &node_info) < 0) return;
     int num_pcpus = node_info.cpus;
@@ -135,7 +135,6 @@ void CPUScheduler(virConnectPtr conn, int interval)
                 stats_db[idx].vcpu_id = vcpu_info[j].number;
                 stats_db[idx].prev_cpu_time = vcpu_info[j].cpuTime;
                 stats_db[idx].current_usage = 0.0; 
-                // Skip calculation for new vCPU so we don't get 0.0 load errors
                 continue;
             }
 
@@ -148,7 +147,7 @@ void CPUScheduler(virConnectPtr conn, int interval)
 
             // Update DB
             stats_db[idx].prev_cpu_time = vcpu_info[j].cpuTime;
-            stats_db[idx].current_usage = usage; // STORE IT HERE for Step 5
+            stats_db[idx].current_usage = usage;
 
             // Update pCPU Load
             int current_pcpu = vcpu_info[j].cpu;
@@ -180,8 +179,6 @@ void CPUScheduler(virConnectPtr conn, int interval)
 
     // --- 5. REBALANCE IF NECESSARY ---
     if (std_dev > 5.0) {
-        printf("Rebalancing required...\n");
-
         virDomainPtr best_domain = NULL;
         int best_vcpu = -1;
         double max_usage_found = -1.0;
@@ -202,12 +199,10 @@ void CPUScheduler(virConnectPtr conn, int interval)
 
             for (int j = 0; j < d_info.nrVirtCpu; j++) {
                 if (v_info[j].cpu == busiest_pcpu) {
-                    // Look up the USAGE we calculated in Step 3
                     for (int k = 0; k < db_count; k++) {
                         if (memcmp(stats_db[k].uuid, uuid, VIR_UUID_BUFLEN) == 0 && 
                             stats_db[k].vcpu_id == v_info[j].number) {
                             
-                            // Use stored usage (robust against recalculation timing)
                             if (stats_db[k].current_usage > max_usage_found) {
                                 max_usage_found = stats_db[k].current_usage;
                                 best_domain = domains[i];
@@ -221,16 +216,42 @@ void CPUScheduler(virConnectPtr conn, int interval)
             free(v_info);
         }
 
-        // Pin the victim
+        // --- NEW LOGIC: PROJECTED STANDARD DEVIATION CHECK ---
         if (best_domain != NULL && max_usage_found > 0.0) {
-            unsigned char *cpumap = calloc(VIR_CPU_MAPLEN(num_pcpus), sizeof(unsigned char));
-            VIR_USE_CPU(cpumap, idlest_pcpu);
+            
+            // 1. Simulate the move in a temporary array
+            double *simulated_loads = malloc(sizeof(double) * num_pcpus);
+            memcpy(simulated_loads, pcpu_loads, sizeof(double) * num_pcpus);
+            
+            simulated_loads[busiest_pcpu] -= max_usage_found;
+            simulated_loads[idlest_pcpu] += max_usage_found;
 
-            if (virDomainPinVcpu(best_domain, best_vcpu, cpumap, VIR_CPU_MAPLEN(num_pcpus)) == 0) {
-                printf(" -> Moved vCPU %d (Load %.2f) from CPU %d to CPU %d\n", 
-                       best_vcpu, max_usage_found, busiest_pcpu, idlest_pcpu);
+            // 2. Calculate the Standard Deviation of this NEW configuration
+            // (Note: Mean remains constant when just moving load)
+            double sim_variance_sum = 0;
+            for (int i = 0; i < num_pcpus; i++) {
+                sim_variance_sum += pow(simulated_loads[i] - mean, 2);
             }
-            free(cpumap);
+            double projected_std_dev = sqrt(sim_variance_sum / num_pcpus);
+            
+            free(simulated_loads);
+
+            // 3. Compare: Only move if the Projected StdDev is BETTER (lower)
+            if (projected_std_dev < std_dev) {
+                // Good move! Proceed to Pin.
+                unsigned char *cpumap = calloc(VIR_CPU_MAPLEN(num_pcpus), sizeof(unsigned char));
+                VIR_USE_CPU(cpumap, idlest_pcpu);
+
+                if (virDomainPinVcpu(best_domain, best_vcpu, cpumap, VIR_CPU_MAPLEN(num_pcpus)) == 0) {
+                    printf(" -> Moving vCPU %d (Load %.2f) from CPU %d to CPU %d (Proj. StdDev: %.2f)\n", 
+                           best_vcpu, max_usage_found, busiest_pcpu, idlest_pcpu, projected_std_dev);
+                }
+                free(cpumap);
+            } else {
+                // Bad move! Skip.
+                printf(" -> Skipping move: Projected StdDev (%.2f) >= Current (%.2f). Logic prevented instability.\n", 
+                       projected_std_dev, std_dev);
+            }
         }
     }
 
