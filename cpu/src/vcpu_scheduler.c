@@ -63,5 +63,30 @@ int main(int argc, char *argv[])
 /* COMPLETE THE IMPLEMENTATION */
 void CPUScheduler(virConnectPtr conn, int interval)
 {
-	
+	// first check the number of active vCPUs
+	virDomainPtr *domains;
+	int num_domains;
+	unsigned int flags = VIR_CONNECT_LIST_DOMAINS_ACTIVE;
+	num_domains = virConnectListAllDomains(conn, &domains, flags);
+
+	if (num_domains < 0)
+	{
+		printf("Failed to get the number of active vCPUs\n");
+		return;
+	}
+
+	printf("Found %d active vCPUs\n", num_domains);
+
+	// for a given interval we must track each guest's vCpu utilization to balance workload between pCPUs
+	// run the virDomainGet* functions from libvirt-domain to gather vCPU statistics
+
+	for (int i = 0; i < num_domains; i++) {
+        virDomainPtr dom = domains[i];
+        
+        // gather statistics
+        virDomainFree(dom);
+    }
+    
+    // free the array of pointers
+    free(domains);
 }
